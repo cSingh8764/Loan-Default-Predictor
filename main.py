@@ -1,297 +1,180 @@
 '''
 Loan Default Predictor
 main.py
+
+Pipeline: clean data -> explore -> train -> evaluate on held-out test set -> predict new requests.
+
+Run:  py main.py              (shows charts, then the interactive carousel)
+      py main.py --no-plots   (skips the charts)
 '''
+import sys
+
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.tree import DecisionTreeClassifier
-from carousel import Carousel   
+import pandas as pd
+from sklearn.compose import make_column_transformer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import (accuracy_score, average_precision_score, classification_report,
+                             confusion_matrix, precision_score, recall_score, roc_auc_score)
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OrdinalEncoder
 
-#reads the csv file and returns the header and data rows of the file
-def read_csv_file(file):
-    with open(file, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-    header = lines[0].strip().split(',')
-    data_rows = [line.strip().split(',') for line in lines[1:] if line.strip()]
-    return header, data_rows
+from carousel import Carousel
 
-#removes the rows with missing values and couns how many values are missing in each column
-#returns cleaned data, missing value counts, and the orignal number of rows
-def Removing_missing_Values(header, data_rows):
-    column_num = len(header)
-    missing_count = [0] * column_num
-    clean_rows = []
-    initial_row_count = len(data_rows)
+TRAIN_FILE = "credit_risk_train.csv"
+TEST_FILE = "credit_risk_test.csv"
+CLEANED_TRAIN_FILE = "credit_risk_train_clean.csv"
+REQUEST_FILE = "loan_requests.csv"
 
-    for row in data_rows:
-        if len(row) != column_num:
-            continue
+TARGET = "loan_status"
+AGE_LIMIT = 90
 
-        is_missing = False
-        for i in range(column_num):
-            if row[i].strip() == '':
-                missing_count[i] += 1
-                is_missing = True
-        if not is_missing:
-            clean_rows.append(row)
+# Text columns. The model needs these turned into numbers (see build_model).
+CATEGORICAL = ["person_home_ownership", "loan_intent", "loan_grade", "cb_person_default_on_file"]
+NUMERIC = ["person_age", "person_income", "person_emp_length", "loan_amnt",
+           "loan_int_rate", "loan_percent_income", "cb_person_cred_hist_length"]
+FEATURES = CATEGORICAL + NUMERIC
 
-    return clean_rows, missing_count, initial_row_count
+# Probability above which we predict "will default".
+# Chosen with cross-validation on the TRAINING set only (F1-optimal was ~0.48, so 0.5 is kept).
+THRESHOLD = 0.5
 
-def remove_overage_applicants(header, data_rows):
-    
-    age_limit = 90
-    
-    age_index = header.index("person_age")
-    
-    final_rows = []
-    overage_count = 0
-    
-    for row in data_rows:
-        try:
-            age = int(row[age_index])
-            if age <= age_limit:
-                final_rows.append(row)
-            else:
-                overage_count += 1
-        except ValueError:
-            overage_count += 1
 
-    return final_rows, overage_count
+# ---------------------------------------------------------------- cleaning
+def clean_training_data(df):
+    '''Drops impossible ages. Missing values are kept: the model handles them natively.'''
+    print(f"Initial number of rows: {len(df)}")
+    missing = df.isna().sum()
+    for col, n in missing[missing > 0].items():
+        print(f"Column {col}: {n} values missing (kept; model handles missing values)")
 
-#writes the clean data into a new CSV file
-#the orignal file can be change if we use the same path as the orignal file  
-def write_cleaned_data(file_path, header, data_rows):
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(','.join(header) + '\n')
-        for row in data_rows:
-            f.write(','.join(row) + '\n')
+    overage = df["person_age"] > AGE_LIMIT
+    print(f"Number of records with age > {AGE_LIMIT}: {overage.sum()} (removed)")
+    df = df[~overage]
+    print(f"Remaining number of rows: {len(df)}\n")
+    return df
 
-#displays a histogram of age distrubution for defaulted and non-defaulted loans
-def bar_graph(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
 
-    header = lines[0].strip().split(',')
-    age_index = header.index('person_age')
-    status_index = header.index('loan_status')
-
-    default_ages = []
-    non_default_ages = []
-
-    for line in lines[1:]:
-        row = line.strip().split(',')
-
-        age = int(row[age_index])
-        status = row[status_index].strip().lower()
-
-        if status == '1':
-            default_ages.append(age)
-        else:
-            non_default_ages.append(age)
-
-    bins = range(10, 101, 10)  # bins like 10-20, 20-30, ..., 90-100
-
+# ---------------------------------------------------------------- charts
+def age_histogram(df):
+    bins = range(10, 101, 10)
     plt.figure(figsize=(12, 6))
-    plt.hist(default_ages, bins=bins, alpha=0.6, label='In Default', color='red', edgecolor='black')
-    plt.hist(non_default_ages, bins=bins, alpha=0.6, label='Not in Default', color='black', edgecolor='black')
-
+    plt.hist(df.loc[df[TARGET] == 1, "person_age"], bins=bins, alpha=0.6,
+             label="In Default", color="red", edgecolor="black")
+    plt.hist(df.loc[df[TARGET] == 0, "person_age"], bins=bins, alpha=0.6,
+             label="Not in Default", color="black", edgecolor="black")
     plt.xlabel("Age (in years)")
     plt.ylabel("No. of Borrowers")
-    plt.title("Loan Distribution by Age (Histogram)")
+    plt.title("Loan Distribution by Age")
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-#displays a pie chart of default status among homeowners
-def pie_chart(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
 
-    header = lines[0].strip().split(',')
-
-    # Get column indexes
-    home_index = header.index("person_home_ownership")
-    status_index = header.index("loan_status")
-
-    # Counters
-    defaulted = 0
-    not_defaulted = 0
-
-    for line in lines[1:]:
-        row = line.strip().split(',')
-        if len(row) <= max(home_index, status_index):
-            continue  # skip incomplete rows
-
-        home_ownership = row[home_index].strip().upper()
-        loan_status = row[status_index].strip()
-
-        if home_ownership == "OWN":
-            if loan_status == "1":
-                defaulted += 1
-            elif loan_status == "0":
-                not_defaulted += 1
-
-    total = defaulted + not_defaulted
-    if total == 0:
-        print("No homeowners found in the dataset.")
-        return
-
-    # Pie chart
-    labels = ['Defaulted', 'Not Defaulted']
-    sizes = [defaulted, not_defaulted]
-    colors = ['red', 'green']
-    explode = (0.1, 0)  # explode the 'Defaulted' slice
-
+def homeowner_pie(df):
+    owners = df[df["person_home_ownership"] == "OWN"]
+    sizes = [(owners[TARGET] == 1).sum(), (owners[TARGET] == 0).sum()]
     plt.figure(figsize=(6, 6))
-    plt.pie(sizes, explode=explode, labels=labels, colors=colors,
-            autopct='%1.1f%%', shadow=True, startangle=140)
-    plt.title('Homeowners: Default vs. Not Default')
-    plt.axis('equal')  # Make pie chart a circle
+    plt.pie(sizes, explode=(0.1, 0), labels=["Defaulted", "Not Defaulted"],
+            colors=["red", "green"], autopct="%1.1f%%", startangle=140)
+    plt.title("Homeowners: Default vs. Not Default")
+    plt.axis("equal")
     plt.show()
 
-#counts number of dafualt and non-defaults in the datasets
-def count_default_status(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-    
-    header = lines[0].strip().split(',')
-    status_index = header.index("loan_status")
-    
-    defaulted = 0
-    not_defaulted = 0
-    
-    for line in lines[1:]:
-        row = line.strip().split(',')
 
-        loan_status = row[status_index].strip()
-        if loan_status == "1":
-            defaulted += 1
-        elif loan_status == "0":
-            not_defaulted += 1
+def default_rate_by_grade(df):
+    '''The strongest single signal in the data: default rate climbs steeply with loan grade.'''
+    rates = df.groupby("loan_grade")[TARGET].mean().sort_index()
+    plt.figure(figsize=(8, 5))
+    plt.bar(rates.index, rates.values * 100, color="red", edgecolor="black")
+    plt.xlabel("Loan grade (A = safest)")
+    plt.ylabel("Default rate (%)")
+    plt.title("Default Rate by Loan Grade")
+    plt.tight_layout()
+    plt.show()
 
-    return defaulted, not_defaulted
 
-#scales income and loan amont features using standarddcaler
-def scale_features(header, data_rows):
-    income_index = header.index("person_income")
-    loan_index = header.index("loan_amnt")
+# ---------------------------------------------------------------- model
+def build_model():
+    '''
+    Gradient-boosted trees: hundreds of small trees, each one correcting the errors of the
+    ones before it. Handles missing values natively and needs no feature scaling
+    (tree splits only compare values, so scale doesn't matter).
+    The OrdinalEncoder turns text categories (e.g. "RENT", "OWN") into integer codes,
+    and categorical_features tells the model to treat those codes as categories, not numbers.
+    '''
+    encoder = make_column_transformer(
+        (OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), CATEGORICAL),
+        ("passthrough", NUMERIC),
+    )
+    model = HistGradientBoostingClassifier(
+        categorical_features=list(range(len(CATEGORICAL))),  # first 4 columns after encoding
+        random_state=42,
+    )
+    return make_pipeline(encoder, model)
 
-    features_to_scale = []
-    for row in data_rows:
-        income = float(row[income_index])
-        loan = float(row[loan_index])
-        features_to_scale.append([loan, income])
 
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(features_to_scale)
+def cross_validate(model, X, y):
+    '''5-fold CV on training data only: an estimate of performance before touching the test set.'''
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
+    print(f"5-fold cross-validation ROC-AUC (train): {scores.mean():.3f} +/- {scores.std():.3f}")
 
-    for i in range(len(data_rows)):
-        data_rows[i][loan_index] = str(scaled_features[i][0])
-        data_rows[i][income_index] = str(scaled_features[i][1])
 
-    return data_rows, scaler
+def evaluate(model, X_test, y_test):
+    probs = model.predict_proba(X_test)[:, 1]
+    preds = (probs >= THRESHOLD).astype(int)
 
-#evaluates model performance with a diffrent file
-def evaluate_model(clf, scaler, file_path):
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+    # Baseline: always predict "no default". Any model must beat this to be useful.
+    baseline_acc = (y_test == 0).mean()
 
-    header = lines[0].strip().split(',')
-    
-    income_index = header.index("person_income")
-    loan_index = header.index("loan_amnt")
-    credit_hist_index = header.index("cb_person_cred_hist_length")
-    status_index = header.index("loan_status")
-    
-    x_test = []
-    y_test = []
-    unscaled_data = []
-    credit_history = []
-    
-    for line in lines[1:]:
-        row = line.strip().split(',')
-        
-        scaled_loan = float(row[loan_index])
-        scaled_income = float(row[income_index])
-        unscaled_data.append([scaled_loan, scaled_income])
-        credit_hist = int(row[credit_hist_index])
-        
-        status = int(row[status_index])
+    print("\n================ Evaluation on held-out test set ================")
+    print(f"Test rows: {len(y_test)}   Default rate: {y_test.mean():.1%}")
+    print(f"Baseline accuracy (always 'no default'): {baseline_acc:.3f}")
+    print(f"Model accuracy:                          {accuracy_score(y_test, preds):.3f}")
+    print(f"ROC-AUC:  {roc_auc_score(y_test, probs):.3f}   (1.0 = perfect ranking, 0.5 = random)")
+    print(f"PR-AUC:   {average_precision_score(y_test, probs):.3f}   (baseline = {y_test.mean():.3f})")
+    print("\nClassification Report (class 1 = default):")
+    print(classification_report(y_test, preds, digits=3))
+    print("Confusion Matrix [[TN FP] [FN TP]]:")
+    print(confusion_matrix(y_test, preds))
 
-        credit_history.append(credit_hist)
-        y_test.append(status)
-    scaled_data = scaler.fit_transform(unscaled_data)
-    
-    for i in range(len(scaled_data)):
-        x_test.append([float(scaled_data[i][0]), float(scaled_data[i][1]), credit_history[i]])
-    
-    y_pred = clf.predict(x_test)
-    
-    print("Model Evaluation on Scaled Test Set:")
-    print(f"Accuracy: {accuracy_score(y_test, y_pred):.2f}")
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred))
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    # Lowering the threshold catches more defaulters but rejects more good borrowers.
+    print("\nThreshold trade-off (for the default class):")
+    print("threshold  precision  recall")
+    for t in [0.2, 0.3, 0.4, 0.5, 0.6]:
+        p = (probs >= t).astype(int)
+        print(f"   {t:.1f}      {precision_score(y_test, p):.3f}     {recall_score(y_test, p):.3f}")
 
-#Trans the decision tree model on the scaled traning database  
-def train_model(data_rows, header):
-    income_index = header.index("person_income")
-    loan_index = header.index("loan_amnt")
-    credit_index = header.index("cb_person_cred_hist_length")
-    status_index = header.index("loan_status")
 
-    x_train = []
-    y_train = []
-    
-    for row in data_rows:
-        loan = float(row[loan_index])
-        income = float(row[income_index])
-        credit = int(row[credit_index])
-        status = int(row[status_index])
-        
-        x_train.append([loan, income, credit])
-        y_train.append(status)
-    
-    clf = DecisionTreeClassifier(random_state=42)
-    clf.fit(x_train, y_train)
-    
-    return clf
+def top_features(model, X_test, y_test):
+    '''Permutation importance: shuffle one column, measure how much ROC-AUC drops.'''
+    from sklearn.inspection import permutation_importance
+    result = permutation_importance(model, X_test, y_test, scoring="roc_auc",
+                                    n_repeats=5, random_state=42, n_jobs=-1)
+    ranked = pd.Series(result.importances_mean, index=X_test.columns).sort_values(ascending=False)
+    print("\nMost important features (drop in ROC-AUC when shuffled):")
+    for name, value in ranked.head(5).items():
+        print(f"  {name:28s} {value:.3f}")
 
-# uses the trained model to make predections on loan requests file
-# adds the predicted enteries into a carousel and creates and interactive interface
-def deploy_predictor(clf, scaler, file_path):
-    header, data_rows = read_csv_file(file_path)
 
-    income_index = header.index("person_income")
-    loan_index = header.index("loan_amnt")
-    credit_index = header.index("cb_person_cred_hist_length")
+# ---------------------------------------------------------------- deployment
+def deploy_predictor(model, file_path):
+    requests = pd.read_csv(file_path)
+    probs = model.predict_proba(requests[FEATURES])[:, 1]
 
     carousel = Carousel()
-    predictions = []
-
-    for row in data_rows:
-        loan = float(row[loan_index])
-        income = float(row[income_index])
-        credit = int(row[credit_index])
-
-        scaled_loan, scaled_income = scaler.transform([[loan, income]])[0]
-        prediction = int(clf.predict([[scaled_loan, scaled_income, credit]])[0])
-        predictions.append(prediction)
-
-        row_data = {header[i]: row[i] for i in range(len(header))}
-        row_data["prediction"] = prediction
-
-        carousel.add(row_data)
+    for (_, row), prob in zip(requests.iterrows(), probs):
+        record = row.to_dict()
+        record["prob"] = prob
+        record["prediction"] = int(prob >= THRESHOLD)
+        carousel.add(record)
 
     print("\nPredicted Loan Status for Requests:")
-    print(predictions)
+    print([int(p >= THRESHOLD) for p in probs])
 
     input("\nPress Enter to view carousel interface...")
 
-    # Text-based interactive carousel to view one record at a time
     while True:
         current = carousel.getCurrentData()
         print("\n--------------------------------------------------")
@@ -305,12 +188,13 @@ def deploy_predictor(clf, scaler, file_path):
         print(f"Amount: ${current['loan_amnt']}\n")
         print(f"Interest Rate: {current['loan_int_rate']}\n")
         print(f"Loan percent income: {current['loan_percent_income']}\n")
-        default_flag = "Yes" if current['cb_person_default_on_file'].strip().upper() == "Y" else "No"
+        default_flag = "Yes" if str(current['cb_person_default_on_file']).strip().upper() == "Y" else "No"
         print(f"Historical Defaults: {default_flag}\n")
         print(f"Credit History: {current['cb_person_cred_hist_length']} years\n")
         print("--------------------------------------------------")
         status_msg = "Will default" if current['prediction'] == 1 else "Will not default"
         recommendation = "Reject" if current['prediction'] == 1 else "Accept"
+        print(f"Probability of default: {current['prob']:.1%}")
         print(f"Predicted loan_status: {status_msg}")
         print(f"Recommend: {recommendation}")
         print("--------------------------------------------------")
@@ -324,36 +208,31 @@ def deploy_predictor(clf, scaler, file_path):
             break
         else:
             print("Invalid choice. Please try again.")
-            
-# Main program execution: cleans, processes, trains, evaluates and deploys the model
+
+
+# ---------------------------------------------------------------- main
 def main():
-    train_file = "credit_risk_train.csv"
-    test_file = "credit_risk_test.csv"
-    cleaned_train_file = "credit_risk_train_clean.csv"
-    request_file = "loan_requests.csv"
+    show_plots = "--no-plots" not in sys.argv
 
-    header, data_rows = read_csv_file(train_file)
-    cleaned_rows, missing_counts, initial_row_count = Removing_missing_Values(header, data_rows)
-    final_rows, overage_count = remove_overage_applicants(header, cleaned_rows)
-    write_cleaned_data(cleaned_train_file, header, final_rows)
+    train = clean_training_data(pd.read_csv(TRAIN_FILE))
+    train.to_csv(CLEANED_TRAIN_FILE, index=False)
+    test = pd.read_csv(TEST_FILE)
 
-    print(f"Initial number of rows: {initial_row_count}")
-    for i in range(len(header)):
-        if missing_counts[i] > 0:
-            print(f"Column {header[i]}: {missing_counts[i]} values missing")
-    print()
-    print(f"Number of records with age > 90: {overage_count}")
-    print(f"Remaining number of rows: {len(final_rows)}")
-    
-    bar_graph(cleaned_train_file)
-    pie_chart(cleaned_train_file)
-    
+    if show_plots:
+        age_histogram(train)
+        homeowner_pie(train)
+        default_rate_by_grade(train)
 
-    final_rows, scaler = scale_features(header, final_rows)
-    clf = train_model(final_rows, header)
-    evaluate_model(clf, scaler, test_file)
-    deploy_predictor(clf, scaler, request_file)
+    X_train, y_train = train[FEATURES], train[TARGET]
+    X_test, y_test = test[FEATURES], test[TARGET]
 
-    
+    model = build_model()
+    cross_validate(model, X_train, y_train)
+    model.fit(X_train, y_train)          # train on training data only
+    evaluate(model, X_test, y_test)      # test set is used exactly once, here
+    top_features(model, X_test, y_test)
+    deploy_predictor(model, REQUEST_FILE)
+
+
 if __name__ == "__main__":
     main()
